@@ -7,104 +7,80 @@ on:
   workflow_dispatch:
     inputs:
       extra_cmd:
-        description: 'Optional extra docker command to run (e.g. "docker images")'  
+        description: 'Extra shell command to run on each server (e.g. "docker images")'
         required: false
         default: ''
 
-# Cancel any in-progress run for the same workflow to avoid pile-up
+# Cancel any in-progress run to avoid pile-up
 concurrency:
   group: mi350-docker-monitor
   cancel-in-progress: true
 
 jobs:
-  # ── Step 1: probe each server in parallel via matrix ────────────────────────
+  # ── Probe each MI350 server in parallel ──────────────────────────────────
   probe:
-    name: "docker ps @ ${{ matrix.host }}"
-    # IMPORTANT: must run on a self-hosted runner that has network access to
-    # the AMD internal .dcgpu domain.  Label the runner 'amd-internal' when
-    # registering it (see README for setup instructions).
-    runs-on: [self-hosted, amd-internal]
+    name: "docker ps @ ${{ matrix.label }}"
 
     strategy:
-      fail-fast: false          # keep other servers running if one fails
+      fail-fast: false   # keep other servers running if one fails
       matrix:
         include:
-          - host: cv350-1e707-c03-2.mkm.dcgpu
-            user: ssubrama1
-            label: cv350-mkm
-          - host: smci350-zts-gtu-b14-05.zts-gtu.dcgpu
-            user: ssubrama1
-            label: smci350-zts
-          - host: cv350-zts-gtu-h41-08.zts-gtu.dcgpu
-            user: ssubrama1
-            label: cv350-zts-h41
-          - host: gbt350-odcdh1-b10-1.png-odc.dcgpu
-            user: ssubrama1
-            label: gbt350-odc
+          # Runner name must match the self-hosted runner registered on each host.
+          # Pattern: aiswhud-mi350-<short-hostname>  (or adjust to actual names below)
+          - label: cv350-mkm
+            runner: aiswhud-mi350-cv350-1e707-c03-2
+          - label: smci350-zts
+            runner: aiswhud-mi350-smci350-zts-gtu-b14-05
+          - label: cv350-zts-h41
+            runner: aiswhud-mi350-cv350-zts-gtu-h41-08
+          - label: gbt350-odc
+            runner: aiswhud-mi350-gbt350-odcdh1-b10-1
+
+    # Each job lands on the specific MI350 server — docker ps runs locally
+    runs-on: ${{ matrix.runner }}
 
     steps:
-      - name: Install SSH key
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.MI350_SSH_KEY }}" > ~/.ssh/id_mi350
-          chmod 600 ~/.ssh/id_mi350
-
-      - name: Add known hosts
-        run: |
-          echo "${{ secrets.MI350_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
-
-      - name: Collect docker ps from ${{ matrix.host }}
+      - name: Collect docker ps
         id: docker_ps
         run: |
           TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
           echo "timestamp=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
 
-          OUTPUT=$(ssh -i ~/.ssh/id_mi350 \
-            -o ConnectTimeout=15 \
-            -o StrictHostKeyChecking=yes \
-            -o BatchMode=yes \
-            ${{ matrix.user }}@${{ matrix.host }} \
-            'hostname; echo "---"; docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}\t{{.Ports}}"' 2>&1)
+          OUTPUT=$(docker ps \
+            --format "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}\t{{.Ports}}")
           echo "output<<EOF" >> "$GITHUB_OUTPUT"
           echo "${OUTPUT}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Run extra command (optional)
-        if: ${{ github.event.inputs.extra_cmd != '' }}
-        run: |
-          ssh -i ~/.ssh/id_mi350 \
-            -o ConnectTimeout=15 \
-            -o StrictHostKeyChecking=yes \
-            -o BatchMode=yes \
-            ${{ matrix.user }}@${{ matrix.host }} \
-            '${{ github.event.inputs.extra_cmd }}'
+          # Count running containers (exclude header line)
+          COUNT=$(echo "${OUTPUT}" | tail -n +2 | grep -c . || true)
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
 
-      - name: Write job summary
+      - name: Collect docker images (optional)
+        id: docker_images
+        if: ${{ github.event.inputs.extra_cmd != '' }}
+        run: ${{ github.event.inputs.extra_cmd }}
+
+      - name: Write per-server job summary
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## ${{ matrix.label }} — ${{ steps.docker_ps.outputs.timestamp }}
 
-          ```
+          **Containers running:** ${{ steps.docker_ps.outputs.count }}
+
+          \`\`\`
           ${{ steps.docker_ps.outputs.output }}
-          ```
+          \`\`\`
 
-          SUMMARY
+          EOF
 
-      - name: Save output artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-ps-${{ matrix.label }}
-          path: /dev/stdin
-          # Write output to a temp file then upload
-        if: false   # placeholder — see 'collect' job below for real artifact
-
-      - name: Write output file for artifact
+      - name: Save output to file for artifact
         run: |
           mkdir -p /tmp/mi350-docker
-          echo "${{ steps.docker_ps.outputs.output }}" \
-            > /tmp/mi350-docker/${{ matrix.label }}.txt
+          {
+            echo "=== ${{ matrix.label }} @ ${{ steps.docker_ps.outputs.timestamp }} ==="
+            echo "${{ steps.docker_ps.outputs.output }}"
+          } > /tmp/mi350-docker/${{ matrix.label }}.txt
 
       - name: Upload per-server artifact
         uses: actions/upload-artifact@v4
@@ -113,14 +89,11 @@ jobs:
           path: /tmp/mi350-docker/${{ matrix.label }}.txt
           retention-days: 7
 
-      - name: Cleanup SSH key
-        if: always()
-        run: rm -f ~/.ssh/id_mi350
-
-  # ── Step 2: merge all artifacts into one summary report ─────────────────────
+  # ── Consolidated summary across all servers ───────────────────────────────
   report:
     name: Consolidated Report
-    runs-on: [self-hosted, amd-internal]
+    # Run the report job on any available MI350 runner
+    runs-on: [self-hosted, mi350]
     needs: probe
     if: always()
 
@@ -135,25 +108,42 @@ jobs:
       - name: Build consolidated summary
         run: |
           TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
-          echo "# MI350 Docker Monitor — ${TIMESTAMP}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Server | Containers Running |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-------------------|" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "# MI350 Docker Monitor — ${TIMESTAMP}"
+            echo ""
+            echo "| Server | Containers Running |"
+            echo "|--------|-------------------|"
 
-          for f in /tmp/mi350-report/*/; do
-            label=$(basename "${f}" | sed 's/docker-ps-//')
-            count=$(grep -c '^[a-f0-9]\{12\}' "${f}"/*.txt 2>/dev/null || echo 0)
-            echo "| ${label} | ${count} |" >> "$GITHUB_STEP_SUMMARY"
-          done
+            for d in /tmp/mi350-report/docker-ps-*/; do
+              label=$(basename "${d}" | sed 's/^docker-ps-//')
+              txt="${d}/${label}.txt"
+              count=0
+              if [[ -f "${txt}" ]]; then
+                # Count non-header, non-separator lines with a container ID
+                count=$(grep -cE '^[a-f0-9]{12}' "${txt}" || true)
+              fi
+              echo "| ${label} | ${count} |"
+            done
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Full Output" >> "$GITHUB_STEP_SUMMARY"
+            echo ""
+            echo "## Full Output"
+            echo ""
 
-          for f in /tmp/mi350-report/*/; do
-            label=$(basename "${f}" | sed 's/docker-ps-//')
-            echo "### ${label}" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat "${f}"/*.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no output)" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-          done
+            for d in /tmp/mi350-report/docker-ps-*/; do
+              label=$(basename "${d}" | sed 's/^docker-ps-//')
+              txt="${d}/${label}.txt"
+              echo "### ${label}"
+              echo '```'
+              if [[ -f "${txt}" ]]; then
+                cat "${txt}"
+              else
+                echo "(no output)"
+              fi
+              echo '```'
+              echo ""
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup temp files
+        if: always()
+        run: rm -rf /tmp/mi350-report /tmp/mi350-docker
