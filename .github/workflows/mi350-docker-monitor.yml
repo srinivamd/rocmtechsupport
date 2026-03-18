@@ -1,0 +1,159 @@
+name: MI350 Docker Process Monitor
+
+on:
+  schedule:
+    # Runs every hour at :00
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      extra_cmd:
+        description: 'Optional extra docker command to run (e.g. "docker images")'  
+        required: false
+        default: ''
+
+# Cancel any in-progress run for the same workflow to avoid pile-up
+concurrency:
+  group: mi350-docker-monitor
+  cancel-in-progress: true
+
+jobs:
+  # ── Step 1: probe each server in parallel via matrix ────────────────────────
+  probe:
+    name: "docker ps @ ${{ matrix.host }}"
+    # IMPORTANT: must run on a self-hosted runner that has network access to
+    # the AMD internal .dcgpu domain.  Label the runner 'amd-internal' when
+    # registering it (see README for setup instructions).
+    runs-on: [self-hosted, amd-internal]
+
+    strategy:
+      fail-fast: false          # keep other servers running if one fails
+      matrix:
+        include:
+          - host: cv350-1e707-c03-2.mkm.dcgpu
+            user: ssubrama1
+            label: cv350-mkm
+          - host: smci350-zts-gtu-b14-05.zts-gtu.dcgpu
+            user: ssubrama1
+            label: smci350-zts
+          - host: cv350-zts-gtu-h41-08.zts-gtu.dcgpu
+            user: ssubrama1
+            label: cv350-zts-h41
+          - host: gbt350-odcdh1-b10-1.png-odc.dcgpu
+            user: ssubrama1
+            label: gbt350-odc
+
+    steps:
+      - name: Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.MI350_SSH_KEY }}" > ~/.ssh/id_mi350
+          chmod 600 ~/.ssh/id_mi350
+
+      - name: Add known hosts
+        run: |
+          echo "${{ secrets.MI350_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Collect docker ps from ${{ matrix.host }}
+        id: docker_ps
+        run: |
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          echo "timestamp=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+
+          OUTPUT=$(ssh -i ~/.ssh/id_mi350 \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            ${{ matrix.user }}@${{ matrix.host }} \
+            'hostname; echo "---"; docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}\t{{.Ports}}"' 2>&1)
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${OUTPUT}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run extra command (optional)
+        if: ${{ github.event.inputs.extra_cmd != '' }}
+        run: |
+          ssh -i ~/.ssh/id_mi350 \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            ${{ matrix.user }}@${{ matrix.host }} \
+            '${{ github.event.inputs.extra_cmd }}'
+
+      - name: Write job summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          ## ${{ matrix.label }} — ${{ steps.docker_ps.outputs.timestamp }}
+
+          ```
+          ${{ steps.docker_ps.outputs.output }}
+          ```
+
+          SUMMARY
+
+      - name: Save output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ps-${{ matrix.label }}
+          path: /dev/stdin
+          # Write output to a temp file then upload
+        if: false   # placeholder — see 'collect' job below for real artifact
+
+      - name: Write output file for artifact
+        run: |
+          mkdir -p /tmp/mi350-docker
+          echo "${{ steps.docker_ps.outputs.output }}" \
+            > /tmp/mi350-docker/${{ matrix.label }}.txt
+
+      - name: Upload per-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ps-${{ matrix.label }}
+          path: /tmp/mi350-docker/${{ matrix.label }}.txt
+          retention-days: 7
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_mi350
+
+  # ── Step 2: merge all artifacts into one summary report ─────────────────────
+  report:
+    name: Consolidated Report
+    runs-on: [self-hosted, amd-internal]
+    needs: probe
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-ps-*
+          path: /tmp/mi350-report
+          merge-multiple: false
+
+      - name: Build consolidated summary
+        run: |
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          echo "# MI350 Docker Monitor — ${TIMESTAMP}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Server | Containers Running |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in /tmp/mi350-report/*/; do
+            label=$(basename "${f}" | sed 's/docker-ps-//')
+            count=$(grep -c '^[a-f0-9]\{12\}' "${f}"/*.txt 2>/dev/null || echo 0)
+            echo "| ${label} | ${count} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Full Output" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in /tmp/mi350-report/*/; do
+            label=$(basename "${f}" | sed 's/docker-ps-//')
+            echo "### ${label}" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "${f}"/*.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no output)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          done
