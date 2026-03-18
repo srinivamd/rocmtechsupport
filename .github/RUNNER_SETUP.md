@@ -1,91 +1,96 @@
-# Self-Hosted Runner Setup for MI350 Monitor
+# Self-Hosted Runner Setup for MI350 Docker Monitor
 
-The `mi350-docker-monitor` workflow requires a GitHub Actions self-hosted runner
-with network access to the AMD internal `.dcgpu` domain.
+The `mi350-docker-monitor` workflow runs `docker ps` **directly on each MI350
+server** using self-hosted runners installed on the hosts.  No SSH keys or
+VPN tunnels are required.
 
-## 1. Register the Runner
+## Runner Naming Convention
 
-On any Linux host that can reach the `.dcgpu` servers (e.g., an AMD VPN-connected
-jump host, or a server already in the AMD datacenter):
+Runners must be registered with a name that includes the server hostname so
+the workflow matrix can target each one individually.  Expected names:
+
+| Server hostname                          | Runner name                                  |
+|------------------------------------------|----------------------------------------------|
+| cv350-1e707-c03-2.mkm.dcgpu             | `aiswhud-mi350-cv350-1e707-c03-2`           |
+| smci350-zts-gtu-b14-05.zts-gtu.dcgpu   | `aiswhud-mi350-smci350-zts-gtu-b14-05`      |
+| cv350-zts-gtu-h41-08.zts-gtu.dcgpu     | `aiswhud-mi350-cv350-zts-gtu-h41-08`        |
+| gbt350-odcdh1-b10-1.png-odc.dcgpu      | `aiswhud-mi350-gbt350-odcdh1-b10-1`         |
+
+If your actual runner names differ, update the `runner:` fields in
+`.github/workflows/mi350-docker-monitor.yml` → `jobs.probe.strategy.matrix`.
+
+---
+
+## Install the Runner on Each MI350 Server
+
+Run the following on **each** MI350 server (substitute the correct token and
+runner name for that host).
 
 ```bash
-# Download the runner from:
-# GitHub → repo → Settings → Actions → Runners → New self-hosted runner
+# 1. Create a dedicated runner user (optional but recommended)
+sudo useradd -m -s /bin/bash github-runner
+sudo usermod -aG docker github-runner   # allow docker ps without sudo
+sudo su - github-runner
 
+# 2. Download the Actions runner (check https://github.com/actions/runner/releases for latest)
 mkdir ~/actions-runner && cd ~/actions-runner
 curl -O -L https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz
 tar xzf actions-runner-linux-x64-2.322.0.tar.gz
 
-# Configure — add label 'amd-internal' so the workflow targets it
+# 3. Register — get TOKEN from:
+#    GitHub → repo → Settings → Actions → Runners → New self-hosted runner
+#    Replace <TOKEN> and <RUNNER-NAME> for each server:
 ./config.sh \
   --url https://github.com/amddcgpuce/rocmtechsupport \
-  --token <TOKEN_FROM_GITHUB_UI> \
-  --labels amd-internal \
-  --name mi350-monitor-runner
+  --token <TOKEN> \
+  --name aiswhud-mi350-cv350-1e707-c03-2 \
+  --labels self-hosted,mi350,aiswhud-mi350-cv350-1e707-c03-2 \
+  --unattended
 
-# Install and start as a service
-sudo ./svc.sh install
+# 4. Install and start as a systemd service
+sudo ./svc.sh install github-runner
 sudo ./svc.sh start
+sudo ./svc.sh status
 ```
 
-## 2. Add GitHub Secrets
+Repeat for each server, changing `--name` and `--labels` to match the table above.
 
-In the repo: **Settings → Secrets and variables → Actions**
+---
 
-### `MI350_SSH_KEY`
-The private SSH key used to log into the MI350 servers (must match the public
-key already installed in `~/.ssh/authorized_keys` on each server via Conductor).
+## Verify Runner Registration
 
-```bash
-# Copy the private key content
-cat ~/.ssh/id_rsa   # or id_ed25519, whichever key Conductor uses
+After installing on all servers, confirm all four appear online:
+
+```
+GitHub → repo → Settings → Actions → Runners
 ```
 
-Paste the entire output (including `-----BEGIN ... KEY-----` / `-----END ... KEY-----`
-lines) as the secret value.
+Each runner should show status **Idle**.
 
-### `MI350_KNOWN_HOSTS`
-Pre-approved host fingerprints to avoid interactive host-key prompts.
+---
 
-```bash
-# Run this from the jump host / runner host:
-ssh-keyscan \
-  cv350-1e707-c03-2.mkm.dcgpu \
-  smci350-zts-gtu-b14-05.zts-gtu.dcgpu \
-  cv350-zts-gtu-h41-08.zts-gtu.dcgpu \
-  gbt350-odcdh1-b10-1.png-odc.dcgpu \
-  2>/dev/null
-```
+## No Secrets Required
 
-Paste the full output as the `MI350_KNOWN_HOSTS` secret value.
+Because each job runs **on** the MI350 server (not SSH-ing into it), the
+workflow needs no `MI350_SSH_KEY` or `MI350_KNOWN_HOSTS` secrets.
+The runner process executes `docker ps` with the permissions of the
+`github-runner` user, which must be in the `docker` group (see step 1 above).
 
-## 3. Verify Connectivity
+---
 
-Before the first scheduled run, confirm the runner host can reach all servers:
-
-```bash
-for h in \
-  cv350-1e707-c03-2.mkm.dcgpu \
-  smci350-zts-gtu-b14-05.zts-gtu.dcgpu \
-  cv350-zts-gtu-h41-08.zts-gtu.dcgpu \
-  gbt350-odcdh1-b10-1.png-odc.dcgpu; do
-  ssh -o ConnectTimeout=5 -i ~/.ssh/id_mi350 ssubrama1@${h} hostname && echo "OK: ${h}" || echo "FAIL: ${h}"
-done
-```
-
-## 4. Trigger Manually
-
-After setup, trigger a test run:
+## Trigger a Manual Test Run
 
 ```
 GitHub → Actions → MI350 Docker Process Monitor → Run workflow
 ```
 
-Optionally pass an extra command (e.g. `docker images`) in the `extra_cmd` input.
+- Leave `extra_cmd` blank for a plain `docker ps`.
+- Or enter e.g. `docker images` to also list pulled images on every server.
 
-## 5. View Results
+## View Results
 
-- **Per-run summary:** Actions tab → select the run → Summary tab
-- **Per-server artifacts:** each run uploads `docker-ps-<label>.txt` files
-  retained for 7 days
-- **History:** all runs listed under the `MI350 Docker Process Monitor` workflow
+| Where | What |
+|-------|------|
+| Actions → run → Summary | Consolidated table + per-server `docker ps` blocks |
+| Actions → run → Artifacts | Per-server `.txt` files (retained 7 days) |
+| Actions → MI350 Docker Process Monitor | Full hourly history |
